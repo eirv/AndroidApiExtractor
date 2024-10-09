@@ -1,0 +1,15 @@
+[versions]
+agp = "8.5.0"
+smali = "3.0.5"
+guava = "33.2.0-android"
+asm = "9.7.1"
+
+[libraries]
+smali-dexlib2 = { group = "com.android.tools.smali", name = "smali-dexlib2", version.ref = "smali" }
+guava = { group = "com.google.guava", name = "guava", version.ref = "guava" }
+asm = { group = "org.ow2.asm", name = "asm", version.ref = "asm" }
+asm-tree = { group = "org.ow2.asm", name = "asm-tree", version.ref = "asm" }
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }
+
