@@ -25,6 +25,7 @@ import android.os.Environment;
 import com.android.tools.smali.dexlib2.AnnotationVisibility;
 import com.android.tools.smali.dexlib2.DexFileFactory;
 import com.android.tools.smali.dexlib2.HiddenApiRestriction;
+import com.android.tools.smali.dexlib2.Opcode;
 import com.android.tools.smali.dexlib2.Opcodes;
 import com.android.tools.smali.dexlib2.ValueType;
 import com.android.tools.smali.dexlib2.dexbacked.DexBackedAnnotation;
@@ -36,8 +37,12 @@ import com.android.tools.smali.dexlib2.iface.Annotation;
 import com.android.tools.smali.dexlib2.iface.AnnotationElement;
 import com.android.tools.smali.dexlib2.iface.BasicAnnotation;
 import com.android.tools.smali.dexlib2.iface.Method;
+import com.android.tools.smali.dexlib2.iface.MethodImplementation;
 import com.android.tools.smali.dexlib2.iface.MethodParameter;
 import com.android.tools.smali.dexlib2.iface.MultiDexContainer;
+import com.android.tools.smali.dexlib2.iface.debug.DebugItem;
+import com.android.tools.smali.dexlib2.iface.debug.StartLocal;
+import com.android.tools.smali.dexlib2.iface.instruction.Instruction;
 import com.android.tools.smali.dexlib2.iface.reference.FieldReference;
 import com.android.tools.smali.dexlib2.iface.reference.MethodReference;
 import com.android.tools.smali.dexlib2.iface.value.AnnotationEncodedValue;
@@ -115,6 +120,7 @@ public class AndroidApiExtractor {
         String name =
                 "android-" + Build.VERSION.SDK_INT + (MAKE_TEST_JAR_FOR_JVM ? "-test.jar" : ".jar");
         File androidJar = new File(Environment.getExternalStorageDirectory(), name);
+        //noinspection IOStreamConstructor
         try (OutputStream out = new BufferedOutputStream(new FileOutputStream(androidJar))) {
             extractor.writeTo(out);
         }
@@ -152,7 +158,7 @@ public class AndroidApiExtractor {
     }
 
     private static boolean isInaccessible(int accessFlags) {
-        if ((accessFlags & ACC_SYNTHETIC) != 0 || (accessFlags & ACC_BRIDGE) != 0) return true;
+        if ((accessFlags & ACC_SYNTHETIC) != 0) return true;
         return (accessFlags & ACC_PUBLIC) == 0 && (accessFlags & ACC_PROTECTED) == 0;
     }
 
@@ -332,6 +338,89 @@ public class AndroidApiExtractor {
         referenced.put(classDef.getType(), classDef);
     }
 
+    private static int getAndFixDexAccessFlags(DexBackedClassDef classDef) {
+        int accessFlags = classDef.getAccessFlags();
+        if ((accessFlags & ACC_INTERFACE) == 0) {
+            accessFlags |= ACC_SUPER;
+        }
+
+        boolean isRecord = isRecord(classDef);
+        if (isRecord) {
+            accessFlags |= ACC_RECORD;
+        }
+
+        if (isDeprecated(classDef.getAnnotations())) {
+            accessFlags |= ACC_DEPRECATED;
+        } else {
+            accessFlags &= ~ACC_DEPRECATED;
+        }
+        return accessFlags;
+    }
+
+    private static boolean isDeprecated(Set<? extends Annotation> annotations) {
+        for (Annotation annotation : annotations) {
+            if (TypeUtils.TYPE_DEPRECATED.equals(annotation.getType())) return true;
+        }
+        return false;
+    }
+
+    private static List<MethodParameterRecord> getParameters(DexBackedMethod method) {
+        ArrayList<MethodParameterRecord> result = new ArrayList<>();
+        boolean hasEmptyParameterName = false;
+        int id = (method.getAccessFlags() & ACC_STATIC) != 0 ? 0 : 1;
+        for (MethodParameter parameter : method.getParameters()) {
+            String name = parameter.getName();
+            String type = parameter.getType();
+            if (name == null) {
+                hasEmptyParameterName = true;
+            }
+            result.add(
+                    new MethodParameterRecord(
+                            id, name, type, parameter.getSignature(), parameter.getAnnotations()));
+            char c = type.charAt(0);
+            id += c == 'J' || c == 'D' ? 2 : 1;
+        }
+
+        if (result.isEmpty()
+                || !hasEmptyParameterName
+                || (method.getAccessFlags() & ACC_ABSTRACT) != 0) return result;
+        id = 1;
+        for (int i = result.size() - 1; i != -1; i--) {
+            MethodParameterRecord r = result.get(i);
+            r.registerId = id;
+            char c = r.type.charAt(0);
+            id += c == 'J' || c == 'D' ? 2 : 1;
+        }
+
+        MethodImplementation implementation = method.getImplementation();
+        assert implementation != null;
+        int registerCount = implementation.getRegisterCount();
+
+        for (DebugItem debugItem : implementation.getDebugItems()) {
+            if (!(debugItem instanceof StartLocal)) continue;
+            StartLocal startLocal = (StartLocal) debugItem;
+
+            id = registerCount - startLocal.getRegister();
+            hasEmptyParameterName = false;
+
+            for (MethodParameterRecord r : result) {
+                if (r.name != null) continue;
+                if (r.registerId != id || !r.type.equals(startLocal.getType())) {
+                    hasEmptyParameterName = true;
+                    continue;
+                }
+                r.name = startLocal.getName();
+                r.signature = startLocal.getSignature();
+            }
+
+            if (!hasEmptyParameterName) {
+                break;
+            }
+        }
+
+        return result;
+    }
+
     public void extract(List<String> jarPaths) throws IOException {
         HashMap<String, DexBackedClassDef> classDefs = new HashMap<>();
         for (String jarPath : jarPaths) {
@@ -383,18 +472,10 @@ public class AndroidApiExtractor {
         if ((accessFlags & ACC_PUBLIC) == 0) return;
 
         InnerClassRecord innerClass = InnerClassRecord.findIn(classDef);
-        if (innerClass == null) {
-            if ((accessFlags & ACC_INTERFACE) == 0) {
-                accessFlags |= ACC_SUPER;
-            }
-        } else if (isInaccessible(innerClass.accessFlags)) {
+        if (innerClass != null && isInaccessible(innerClass.accessFlags)) {
             return;
         }
-
-        boolean isRecord = isRecord(classDef);
-        if (isRecord) {
-            accessFlags |= ACC_RECORD;
-        }
+        accessFlags = getAndFixDexAccessFlags(classDef);
 
         String name = TypeUtils.toCfName(classDef.getType());
         String superclass = classDef.getSuperclass();
@@ -412,7 +493,7 @@ public class AndroidApiExtractor {
         }
 
         ClassNode classNode = new ClassNode();
-        classNode.version = isRecord ? V17 : V1_8;
+        classNode.version = (accessFlags & ACC_RECORD) != 0 ? V17 : V1_8;
         classNode.access = accessFlags;
         classNode.name = name;
         classNode.signature = TypeUtils.getSignature(classDef.getAnnotations());
@@ -460,22 +541,16 @@ public class AndroidApiExtractor {
     }
 
     private void transformInaccessibleClass(DexBackedClassDef classDef) {
-        int accessFlags = classDef.getAccessFlags();
-
         InnerClassRecord innerClass = InnerClassRecord.findIn(classDef);
-        if (innerClass == null && (accessFlags & ACC_INTERFACE) == 0) {
-            accessFlags |= ACC_SUPER;
+        if (innerClass != null && isInaccessible(innerClass.accessFlags)) {
+            return;
         }
 
-        boolean isRecord = isRecord(classDef);
-        if (isRecord) {
-            accessFlags |= ACC_RECORD;
-        }
-
+        int accessFlags = getAndFixDexAccessFlags(classDef);
         String name = TypeUtils.toCfName(classDef.getType());
         ClassWriter classWriter = new ClassWriter(0);
         classWriter.visit(
-                isRecord ? V17 : V1_8,
+                (accessFlags & ACC_RECORD) != 0 ? V17 : V1_8,
                 accessFlags,
                 name,
                 TypeUtils.getSignature(classDef.getAnnotations()),
@@ -574,15 +649,24 @@ public class AndroidApiExtractor {
     }
 
     private void transformField(ClassNode classNode, DexBackedField field) {
-        if (isInaccessible(field.getAccessFlags())) return;
+        int accessFlags = field.getAccessFlags();
+        if (isInaccessible(accessFlags)) return;
+
         Object initialValue = null;
-        if ((field.getAccessFlags() & ACC_FINAL) != 0
+        if ((accessFlags & ACC_FINAL) != 0
                 && !field.getDefiningClass().startsWith("Lcom/android/internal/R$")) {
             initialValue = toAsmValue(field.getInitialValue());
         }
+
+        if (isDeprecated(field.getAnnotations())) {
+            accessFlags |= ACC_DEPRECATED;
+        } else {
+            accessFlags &= ~ACC_DEPRECATED;
+        }
+
         FieldVisitor fieldVisitor =
                 classNode.visitField(
-                        field.getAccessFlags(),
+                        accessFlags,
                         field.getName(),
                         TypeUtils.wrapType(field.getType()),
                         TypeUtils.getSignature(field.getAnnotations()),
@@ -625,18 +709,40 @@ public class AndroidApiExtractor {
     }
 
     private void transformMethod(ClassNode classNode, DexBackedMethod method) {
-        if (isInaccessible(method.getAccessFlags()) || isObjectMethod(method)) return;
+        int accessFlags = method.getAccessFlags();
+        if (isInaccessible(accessFlags)
+                || (accessFlags & ACC_BRIDGE) != 0
+                || isObjectMethod(method)) return;
         if ("<clinit>".equals(method.getName())) return;
+
         Set<? extends Annotation> annotations = method.getAnnotations();
+        if (isDeprecated(annotations)) {
+            accessFlags |= ACC_DEPRECATED;
+        } else {
+            accessFlags &= ~ACC_DEPRECATED;
+        }
+
+        MethodImplementation implementation = method.getImplementation();
+        if (implementation != null
+                && (method.getAccessFlags() & 0x20000 /* declared-synchronized */) != 0) {
+            for (Instruction instruction : implementation.getInstructions()) {
+                if (instruction.getOpcode() != Opcode.MONITOR_ENTER) continue;
+                accessFlags |= ACC_SYNCHRONIZED;
+                break;
+            }
+        }
+
         MethodVisitor methodVisitor =
                 classNode.visitMethod(
-                        method.getAccessFlags(),
+                        accessFlags,
                         method.getName(),
                         TypeUtils.getMethodDescriptor(method),
                         TypeUtils.getSignature(annotations),
                         TypeUtils.getExceptions(annotations));
         transformMethodAnnotation(methodVisitor, method);
-        transformMethodImplementation(methodVisitor, method);
+        if (implementation != null) {
+            transformMethodImplementation(methodVisitor, method);
+        }
         methodVisitor.visitEnd();
     }
 
@@ -684,7 +790,11 @@ public class AndroidApiExtractor {
 
     private void transformMethodImplementation(
             MethodVisitor methodVisitor, DexBackedMethod method) {
-        if (method.getImplementation() == null) return;
+        List<MethodParameterRecord> parameters = getParameters(method);
+        for (MethodParameterRecord param : parameters) {
+            if (param.name == null) break;
+            methodVisitor.visitParameter(param.name, 0);
+        }
         methodVisitor.visitCode();
         Label labelStart = new Label();
         methodVisitor.visitLabel(labelStart);
@@ -755,11 +865,10 @@ public class AndroidApiExtractor {
             methodVisitor.visitLocalVariable(
                     "this", method.getDefiningClass(), null, labelStart, labelEnd, 0);
         }
-        int paramId = isStatic ? 0 : 1;
         int paramIndex = 0;
-        for (MethodParameter param : method.getParameters()) {
-            String paramName = param.getName();
-            String paramSignature = param.getSignature();
+        for (MethodParameterRecord param : parameters) {
+            String paramName = param.name;
+            String paramSignature = param.signature;
 
             if (paramName != null || paramSignature != null) {
                 if (paramName == null) {
@@ -767,22 +876,23 @@ public class AndroidApiExtractor {
                 }
                 methodVisitor.visitLocalVariable(
                         paramName,
-                        TypeUtils.wrapType(param.getType()),
+                        TypeUtils.wrapType(param.type),
                         paramSignature,
                         labelStart,
                         labelEnd,
-                        paramId);
+                        param.id);
                 transformMethodParameterAnnotation(methodVisitor, param, paramIndex++);
             } else ++paramIndex;
-            char c = param.getType().charAt(0);
-            paramId += c == 'J' || c == 'D' ? 2 : 1;
         }
-        methodVisitor.visitMaxs(maxStack, paramId);
+        int parameterCount = parameters.size();
+        int maxLocals =
+                parameterCount != 0 ? parameters.get(parameterCount - 1).id : isStatic ? 0 : 1;
+        methodVisitor.visitMaxs(maxStack, maxLocals);
     }
 
     private void transformMethodParameterAnnotation(
-            MethodVisitor methodVisitor, MethodParameter param, int paramIndex) {
-        for (Annotation annotation : param.getAnnotations()) {
+            MethodVisitor methodVisitor, MethodParameterRecord param, int paramIndex) {
+        for (Annotation annotation : param.annotations) {
             if (TypeUtils.TYPE_DALVIK_SIGNATURE.equals(annotation.getType())) continue;
             transformAnnotationElement(
                     methodVisitor.visitParameterAnnotation(
@@ -950,6 +1060,8 @@ public class AndroidApiExtractor {
 
         if (!APPEND_RESOURCE_FILES && !APPEND_RESOURCE_BLOCKS) return;
         System.out.println("Writing resources");
+
+        //noinspection IOStreamConstructor
         try (ZipInputStream zip =
                 new ZipInputStream(
                         new BufferedInputStream(

@@ -48,6 +48,7 @@ public class TypeUtils {
     public static final String TYPE_STRING = "Ljava/lang/String;";
     public static final String TYPE_THROWABLE = "Ljava/lang/Throwable;";
     public static final String TYPE_ANNOTATION = "Ljava/lang/Annotation;";
+    public static final String TYPE_DEPRECATED = "Ljava/lang/Deprecated;";
 
     private static final String TEST_PREFIX = "__renamed/";
 
@@ -75,7 +76,10 @@ public class TypeUtils {
 
     public static String getOuterName(String name) {
         int index = name.lastIndexOf('/');
-        return name.substring(0, name.indexOf('$', index));
+        if (index == -1) index = 0;
+        int dollar = name.indexOf('$', index);
+        if (dollar == -1) return name;
+        return name.substring(0, dollar);
     }
 
     public static String getMethodDescriptor(MethodReference method) {
